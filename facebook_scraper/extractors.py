@@ -606,6 +606,8 @@ class PostExtractor:
                 if errors > 5:
                     logger.error("Reached image error limit")
                     break
+            logger.error("Reached image limit")    
+            break    
         image = images[0] if images else None
         image_id = image_ids[0] if image_ids else None
         return {

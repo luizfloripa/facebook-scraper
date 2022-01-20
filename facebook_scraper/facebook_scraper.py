@@ -45,9 +45,15 @@ class FacebookScraper:
 
     base_url = FB_MOBILE_BASE_URL
     default_headers = {
-        'Accept-Language': 'en-US,en;q=0.5',
-        "Sec-Fetch-User": "?1",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/603.3.8 (KHTML, like Gecko) Version/10.1.2 Safari/603.3.8",
+        'accept-language': 'en-US,en;q=0.5',
+        'sec-ch-ua-mobile': '?1',
+        'dnt': '1',
+        'upgrade-insecure-requests': '1',
+        # 'sec-fetch-site': 'none',
+        # 'sec-fetch-mode': 'navigate',
+        # 'sec-fetch-dest': 'document',
+        "sec-fetch-user": "?1",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/603.3.8 (KHTML, like Gecko) Version/10.1.2 Safari/603.3.8",
     }
     have_checked_locale = False
 
