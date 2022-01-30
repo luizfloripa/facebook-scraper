@@ -598,6 +598,14 @@ class FacebookScraper:
             resp = self.get(url)
             desc = resp.html.find("meta[name='description']", first=True)
             try:
+                cover_photo = resp.html.find("#msite-pages-header-contents i.coverPhoto", first=True)
+                if cover_photo:
+                    match = re.search(r"url\('(.+)'\)", cover_photo.attrs["style"])
+                    if match:
+                        result["cover_photo"] = utils.decode_css_url(match.groups()[0])
+                profile_photo = resp.html.find("#msite-pages-header-contents img", first=True)
+                if profile_photo:
+                    result["profile_photo"] = profile_photo.attrs["src"]                
                 elem = resp.html.find("script[type='application/ld+json']", first=True)
                 meta = json.loads(elem.text)
                 result.update(meta["author"])
