@@ -98,6 +98,7 @@ class PostExtractor:
             'text': None,
             'post_text': None,
             'shared_text': None,
+            'original_text': None,
             'time': None,
             'timestamp': None,
             'image': None,
@@ -272,7 +273,10 @@ class PostExtractor:
             post_text = []
             shared_text = []
             ended = False
-            for node in nodes[1:]:
+            index_non_header = next(
+                (i for i, node in enumerate(nodes) if node.tag != 'header'), 1
+            )
+            for node in nodes[index_non_header:]:
                 if node.tag == 'header':
                     ended = True
 
@@ -296,10 +300,22 @@ class PostExtractor:
             post_text = paragraph_separator.join(post_text)
             shared_text = paragraph_separator.join(shared_text)
 
+            original_text = None
+            hidden_div = element.find('div[style="display:none"]', first=True)
+            if hidden_div:
+                original_text = []
+                for node in hidden_div.find("p,span[role=presentation]"):
+                    node = utils.make_html_element(
+                        html=node.html.replace('>… <', '><', 1).replace('>More<', '', 1)
+                    )
+                    original_text.append(node.text)
+                original_text = paragraph_separator.join(original_text)
+
             return {
                 'text': text,
                 'post_text': post_text,
                 'shared_text': shared_text,
+                'original_text': original_text,
             }
         elif element.find(".story_body_container>div", first=True):
             text = element.find(".story_body_container>div", first=True).text
@@ -618,33 +634,60 @@ class PostExtractor:
             "image_ids": image_ids,
         }
 
-    def extract_reactors(self, response, reaction_lookup):
+    def extract_reactors(self, response, reaction_lookup=utils.reaction_lookup):
         """Fetch people reacting to an existing post obtained by `get_posts`.
         Note that this method may raise one more http request per post to get all reactors"""
-        emoji_class_lookup = {}
-        spriteMapCssClass = "sp_E24l_TeOlgh"
-        for k, v in self.get_jsmod("UFIReactionIcons").items():
+        emoji_url_lookup = {}
+        spriteMapCssClass = "sp_LdwxfpG67Bn"
+        emoji_class_lookup = utils.emoji_class_lookup
+        reaction_icons = self.get_jsmod("UFIReactionIcons")
+        if reaction_icons:
+            for k, v in reaction_icons.items():
+                name = reaction_lookup[k]["display_name"].lower()
+                for item in v.values():
+                    emoji_class_lookup[item["spriteCssClass"]] = name
+                    spriteMapCssClass = item["spriteMapCssClass"]
+        for sigil in response.html.find("span[data-sigil='reaction_profile_sigil']"):
+            single_reaction = demjson.decode(sigil.attrs.get("data-store"))
+            if "reactionType" in single_reaction:
+                k = str(single_reaction["reactionType"])
+            else:
+                k = str(single_reaction["reactionID"])
+            if k == "all":
+                continue
             name = reaction_lookup[k]["display_name"].lower()
-            for item in v.values():
-                emoji_class_lookup[item["spriteCssClass"]] = name
-                spriteMapCssClass = item["spriteMapCssClass"]
+            emoji_style = sigil.find("i", first=True).attrs.get("style")
+            emoji_url = utils.get_background_image_url(emoji_style)
+            emoji_url_lookup[emoji_url] = name
 
         reactors_opt = self.options.get("reactors")
-        limit = 3000
+        limit = 1e9
         if type(reactors_opt) in [int, float] and reactors_opt < limit:
             limit = reactors_opt
         logger.debug(f"Fetching {limit} reactors")
         elems = list(response.html.find("div[id^='reaction_profile_browser']>div"))
         for elem in elems:
-            emoji_class = elem.find(f"div>i.{spriteMapCssClass}", first=True).attrs.get("class")[
-                -1
-            ]
-            if not emoji_class_lookup.get(emoji_class):
-                logger.error(f"Don't know {emoji_class}")
+            try:
+                emoji_class = elem.find(f"div>i.{spriteMapCssClass}", first=True).attrs.get(
+                    "class"
+                )[-1]
+                reaction_type = emoji_class_lookup.get(emoji_class)
+                if not reaction_type:
+                    logger.error(f"Don't know {emoji_class}")
+            except AttributeError:
+                try:
+                    emoji_style = elem.find(f"div>i[style]", first=True).attrs.get("style")
+                    emoji_url = utils.get_background_image_url(emoji_style)
+                    reaction_type = emoji_url_lookup.get(emoji_url)
+                    if not reaction_type:
+                        logger.error(f"Don't know {emoji_url}")
+                except AttributeError:
+                    logger.error(f"No div>i[style] elem in: {elem}")
+                    reaction_type = None
             yield {
                 "name": elem.find("strong", first=True).text,
                 "link": utils.urljoin(FB_BASE_URL, elem.find("a", first=True).attrs.get("href")),
-                "type": emoji_class_lookup.get(emoji_class),
+                "type": reaction_type,
             }
         more = response.html.find("div[id^=reaction_profile_pager] a", first=True)
         while more and len(elems) < limit:
@@ -668,17 +711,37 @@ class PostExtractor:
                         'div#reaction_profile_browser>div,div#reaction_profile_browser1>div'
                     )
                     for elem in elems:
-                        emoji_class = elem.find(
-                            f"div>i.{spriteMapCssClass}", first=True
-                        ).attrs.get("class")[-1]
-                        if not emoji_class_lookup.get(emoji_class):
-                            logger.error(f"Don't know {emoji_class}")
+                        if not elem.find(f"div>i.{spriteMapCssClass}", first=True):
+                            # Try update spriteMapCssClass
+                            classes = elem.find("div>i.img", first=True).attrs["class"]
+                            for c in classes:
+                                if c.startswith("sp_"):
+                                    spriteMapCssClass = c
+                        try:
+                            emoji_class = elem.find(
+                                f"div>i.{spriteMapCssClass}", first=True
+                            ).attrs.get("class")[-1]
+                            reaction_type = emoji_class_lookup.get(emoji_class)
+                            if not reaction_type:
+                                logger.error(f"Don't know {emoji_class}")
+                        except AttributeError:
+                            try:
+                                emoji_style = elem.find(f"div>i[style]", first=True).attrs.get(
+                                    "style"
+                                )
+                                emoji_url = utils.get_background_image_url(emoji_style)
+                                reaction_type = emoji_url_lookup.get(emoji_url)
+                                if not reaction_type:
+                                    logger.error(f"Don't know {emoji_url}")
+                            except AttributeError:
+                                logger.error(f"No div>i[style] elem in: {elem.html}")
+                                reaction_type = None
                         yield {
                             "name": elem.find("strong", first=True).text,
                             "link": utils.urljoin(
                                 FB_BASE_URL, elem.find("a", first=True).attrs.get("href")
                             ),
-                            "type": emoji_class_lookup.get(emoji_class),
+                            "type": reaction_type,
                         }
                 elif action['cmd'] == 'replace':
                     html = utils.make_html_element(
@@ -708,7 +771,7 @@ class PostExtractor:
             else:
                 share_url = None
 
-    def extract_reactions(self, post_id=None) -> PartialPost:
+    def extract_reactions(self, post_id=None, force_parse_HTML=False) -> PartialPost:
         """Fetch share and reactions information with a existing post obtained by `get_posts`.
         Return a merged post that has some new fields including `reactions`, `w3_fb_url`,
         `fetched_time`, and reactions fields `LIKE`, `ANGER`, `SORRY`, `WOW`, `LOVE`, `HAHA` if
@@ -725,13 +788,14 @@ class PostExtractor:
         """
         reactions = {}
 
-        reaction_lookup = self.get_jsmod("UFIReactionTypes")
-        if reaction_lookup:
-            reaction_lookup = reaction_lookup.get("reactions")
-            for k, v in self.live_data.get("reactioncountmap", {}).items():
-                if v["default"]:
-                    name = reaction_lookup[k]["display_name"].lower()
-                    reactions[name] = v["default"]
+        reaction_lookup = utils.reaction_lookup
+        reaction_lookup_jsmod = self.get_jsmod("UFIReactionTypes")
+        if reaction_lookup_jsmod:
+            reaction_lookup.update(reaction_lookup_jsmod.get("reactions"))
+        for k, v in self.live_data.get("reactioncountmap", {}).items():
+            if v["default"]:
+                name = reaction_lookup[k]["display_name"].lower()
+                reactions[name] = v["default"]
         reaction_count = self.live_data.get("reactioncount")
 
         url = self.post.get('post_url')
@@ -745,10 +809,15 @@ class PostExtractor:
             reaction_url = f'https://m.facebook.com/ufi/reaction/profile/browser/?ft_ent_identifier={post_id}'
             logger.debug(f"Fetching {reaction_url}")
             response = self.request(reaction_url)
-
-            if not reactions:
+            if not reactions or force_parse_HTML:
+                reactions = {}
+                reaction_count = 0
                 for sigil in response.html.find("span[data-sigil='reaction_profile_sigil']"):
-                    k = str(demjson.decode(sigil.attrs.get("data-store"))["reactionType"])
+                    single_reaction = demjson.decode(sigil.attrs.get("data-store"))
+                    if "reactionType" in single_reaction:
+                        k = str(single_reaction["reactionType"])
+                    else:
+                        k = str(single_reaction["reactionID"])
                     v = sigil.find(
                         "span[data-sigil='reaction_profile_tab_count']", first=True
                     ).text.replace("All ", "")
@@ -758,6 +827,8 @@ class PostExtractor:
                     elif k in reaction_lookup:
                         name = reaction_lookup[k]["display_name"].lower()
                         reactions[name] = v
+                if not reaction_count:
+                    reaction_count = sum(reactions.values())
             reactors = self.extract_reactors(response, reaction_lookup)
 
         if reactions:
@@ -1001,10 +1072,12 @@ class PostExtractor:
         if comment_reactors_opt:
             self.options["reactors"] = True  # Required for comment reaction extraction
             reactors = comment.find(
-                'a[href^="/ufi/reaction/profile/browser/?ft_ent_identifier="] i', first=True
+                'a[href^="/ufi/reaction/profile/browser/?ft_ent_identifier="] i,'
+                'a[href^="/ufi/reaction/profile/browser/?ft_ent_identifier="] img',
+                first=True,
             )
             if reactors:
-                reactions = self.extract_reactions(comment_id)
+                reactions = self.extract_reactions(comment_id, force_parse_HTML=True)
                 if comment_reactors_opt != "generator":
                     reactions["reactors"] = utils.safe_consume(reactions.get("reactors", []))
 
@@ -1100,14 +1173,14 @@ class PostExtractor:
             more = elem.find(more_selector, first=True)
 
         # Comment limiting and progress
-        limit = 5000  # Default
+        limit = 1e9  # Default
         if more and more.attrs.get("data-ajaxify-href"):
             parsed = parse_qs(urlparse(more.attrs.get("data-ajaxify-href")).query)
             count = int(parsed.get("count")[0])
             if count < limit:
                 limit = count
         comments_opt = self.options.get('comments')
-        if type(comments_opt) in [int, float] and comments_opt < limit:
+        if type(comments_opt) in [int, float]:
             limit = comments_opt
         logger.debug(f"Fetching up to {limit} comments")
 
@@ -1153,6 +1226,7 @@ class PostExtractor:
                 logger.warning("No comments found on page")
                 break
             more_comments = elem.find(comments_selector)
+            comments.extend(more_comments)
             if not more_comments:
                 logger.warning("No comments found on page")
                 break

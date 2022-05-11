@@ -18,7 +18,6 @@ import traceback
 import time
 from datetime import datetime, timedelta
 import re
-import browser_cookie3
 
 
 _scraper = FacebookScraper()
@@ -27,7 +26,14 @@ _scraper = FacebookScraper()
 def set_cookies(cookies):
     if isinstance(cookies, str):
         if cookies == "from_browser":
-            cookies = browser_cookie3.load(domain_name='.facebook.com')
+            try:
+                import browser_cookie3
+
+                cookies = browser_cookie3.load(domain_name='.facebook.com')
+            except:
+                raise ModuleNotFoundError(
+                    "browser_cookie3 must be installed to use browser cookies"
+                )
         else:
             try:
                 cookies = parse_cookie_file(cookies)
@@ -50,8 +56,8 @@ def unset_cookies():
     _scraper.session.cookies = cookiejar_from_dict({})
 
 
-def set_proxy(proxy):
-    _scraper.set_proxy(proxy)
+def set_proxy(proxy, verify=True):
+    _scraper.set_proxy(proxy, verify)
 
 
 def set_user_agent(user_agent):
@@ -76,6 +82,22 @@ def get_profile(
     cookies = kwargs.pop('cookies', None)
     set_cookies(cookies)
     return _scraper.get_profile(account, **kwargs)
+
+
+def get_reactors(
+    post_id: Union[str, int],
+    **kwargs,
+) -> Iterator[dict]:
+    """Get reactors for a given post ID
+    Args:
+        post_id(str): The post ID, as returned from get_posts
+        cookies (Union[dict, CookieJar, str]): Cookie jar to use.
+            Can also be a filename to load the cookies from a file (Netscape format).
+    """
+    _scraper.requests_kwargs['timeout'] = kwargs.pop('timeout', DEFAULT_REQUESTS_TIMEOUT)
+    cookies = kwargs.pop('cookies', None)
+    set_cookies(cookies)
+    return _scraper.get_reactors(post_id, **kwargs)
 
 
 def get_friends(

@@ -6,8 +6,10 @@ import re
 from functools import partial
 from typing import Iterator, Union
 import json
+import demjson3 as demjson
 from urllib.parse import parse_qs, urlparse, unquote
 from datetime import datetime
+import os
 
 from requests import RequestException
 from requests_html import HTMLSession
@@ -79,8 +81,10 @@ class FacebookScraper:
         else:
             self.session.cookies.set("noscript", "0")
 
-    def set_proxy(self, proxy):
-        self.requests_kwargs.update({'proxies': {'http': proxy, 'https': proxy}})
+    def set_proxy(self, proxy, verify=True):
+        self.requests_kwargs.update(
+            {'proxies': {'http': proxy, 'https': proxy}, 'verify': verify}
+        )
         ip = self.get(
             "http://lumtest.com/myip.json", headers={"Accept": "application/json"}
         ).json()
@@ -90,6 +94,15 @@ class FacebookScraper:
         kwargs["scraper"] = self
         iter_pages_fn = partial(iter_pages, account=account, request_fn=self.get, **kwargs)
         return self._generic_get_posts(extract_post, iter_pages_fn, **kwargs)
+
+    def get_reactors(self, post_id: int, **kwargs) -> Iterator[dict]:
+        reaction_url = (
+            f'https://m.facebook.com/ufi/reaction/profile/browser/?ft_ent_identifier={post_id}'
+        )
+        logger.debug(f"Fetching {reaction_url}")
+        response = self.get(reaction_url)
+        extractor = PostExtractor(response.html, kwargs, self.get, full_post_html=response.html)
+        return extractor.extract_reactors(response)
 
     def get_photos(self, account: str, **kwargs) -> Iterator[Post]:
         iter_pages_fn = partial(iter_photos, account=account, request_fn=self.get, **kwargs)
@@ -296,6 +309,13 @@ class FacebookScraper:
         if kwargs.get("allow_extra_requests", True):
             logger.debug(f"Requesting page from: {account}")
             response = self.get(account)
+            top_post = response.html.find(
+                '[data-ft*="top_level_post_id"]:not([data-sigil="m-see-translate-link"])',
+                first=True,
+            )
+            result["latest_post_id"] = PostExtractor(
+                top_post, kwargs, self.get
+            ).extract_post_id()["post_id"]
 
             try:
                 result["Friend_count"] = utils.parse_int(
@@ -369,7 +389,7 @@ class FacebookScraper:
         about_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/{account}/about/')
         logger.debug(f"Requesting page from: {about_url}")
         response = self.get(about_url)
-        match = re.search(r'entity_id:(\d+),', response.html.html)
+        match = re.search(r'entity_id:(\d+)', response.html.html)
         if match:
             result["id"] = match.group(1)
         # Profile name is in the title
@@ -551,22 +571,35 @@ class FacebookScraper:
                     more_url = more_url.group(1)
 
             for elem in elems:
-                links = elem.find("a")
-                if not links:
+                header_elem = elem.find("div[data-nt='FB:TEXT4']:has(span)", first=True)
+                if not header_elem:
                     continue
-                text_elem = elem.find("div[data-nt='FB:FEED_TEXT']", first=True)
+                bits = list(header_elem.element.itertext())
+                username = bits[0].strip()
+                recommends = "recommends" in header_elem.text
+                links = header_elem.find("a")
+                if len(links) == 2:
+                    user_url = utils.urljoin(FB_BASE_URL, links[0].attrs["href"])
+                else:
+                    user_url = None
+                text_elem = elem.find("div[data-nt='FB:FEED_TEXT'] span p", first=True)
+                if text_elem:
+                    text = text_elem.text
+                else:
+                    text = None
                 date_element = elem.find("abbr[data-store*='time']", first=True)
                 time = json.loads(date_element.attrs["data-store"])["time"]
                 yield {
-                    "user_url": utils.urljoin(FB_BASE_URL, links[0].attrs["href"]),
-                    "username": links[0].text,
+                    "user_url": user_url,
+                    "username": username,
                     "profile_picture": elem.find("img", first=True).attrs["src"],
-                    "text": text_elem.find("span p", first=True).text,
+                    "text": text,
+                    "header": header_elem.text,
                     "time": datetime.fromtimestamp(time),
                     "timestamp": time,
-                    "recommends": "</span> recommends <span>" in elem.html,
+                    "recommends": recommends,
                     "post_url": utils.urljoin(
-                        FB_BASE_URL, text_elem.find("a[href*='story']", first=True).attrs["href"]
+                        FB_BASE_URL, elem.find("a[href*='story']", first=True).attrs["href"]
                     ),
                 }
 
@@ -597,24 +630,27 @@ class FacebookScraper:
             logger.debug(f"Requesting page from: {url}")
             resp = self.get(url)
             desc = resp.html.find("meta[name='description']", first=True)
+            ld_json = None
             try:
-                cover_photo = resp.html.find("#msite-pages-header-contents i.coverPhoto", first=True)
-                if cover_photo:
-                    match = re.search(r"url\('(.+)'\)", cover_photo.attrs["style"])
-                    if match:
-                        result["cover_photo"] = utils.decode_css_url(match.groups()[0])
-                profile_photo = resp.html.find("#msite-pages-header-contents img", first=True)
-                if profile_photo:
-                    result["profile_photo"] = profile_photo.attrs["src"]                
-                elem = resp.html.find("script[type='application/ld+json']", first=True)
-                meta = json.loads(elem.text)
+                ld_json = resp.html.find("script[type='application/ld+json']", first=True).text
+            except:
+                logger.error("No ld+json element")
+                url = f'/{page}/community'
+                logger.debug(f"Requesting page from: {url}")
+                try:
+                    community_resp = self.get(url)
+                    ld_json = community_resp.html.find(
+                        "script[type='application/ld+json']", first=True
+                    ).text
+                except:
+                    logger.error("No ld+json element")
+            if ld_json:
+                meta = demjson.decode(ld_json)
                 result.update(meta["author"])
                 result["type"] = result.pop("@type")
                 for interaction in meta.get("interactionStatistic", []):
                     if interaction["interactionType"] == "http://schema.org/FollowAction":
                         result["followers"] = interaction["userInteractionCount"]
-            except:
-                logger.error("No ld+json element")
             try:
                 result["about"] = resp.html.find(
                     '#pages_msite_body_contents>div>div:nth-child(2)', first=True
@@ -684,7 +720,26 @@ class FacebookScraper:
         logger.debug(f"Requesting page from: {url}")
         try:
             resp = self.get(url).html
-            admins = resp.find("div:first-child>div.touchable a:not(.touchable)")
+            url = resp.find("a[href*='listType=list_admin_moderator']", first=True)
+            if url:
+                url = url.attrs.get("href")
+                logger.debug(f"Requesting page from: {url}")
+                try:
+                    respAdmins = self.get(url).html
+                except:
+                    raise exceptions.UnexpectedResponse("Unable to get admin list")
+            else:
+                respAdmins = resp
+            # Test if we are a member that can add new members
+            if re.match(
+                "/groups/members/search",
+                respAdmins.find(
+                    "div:nth-child(1)>div:nth-child(1) a:not(.touchable)", first=True
+                ).attrs.get('href'),
+            ):
+                admins = respAdmins.find("div:nth-of-type(2)>div.touchable a:not(.touchable)")
+            else:
+                admins = respAdmins.find("div:first-child>div.touchable a:not(.touchable)")
             result["admins"] = [
                 {
                     "name": e.text,
@@ -692,7 +747,8 @@ class FacebookScraper:
                 }
                 for e in admins
             ]
-            url = resp.find("a[href^='/browse/group/members']", first=True)
+
+            url = resp.find("a[href*='listType=list_nonfriend_nonadmin']", first=True)
             if url:
                 url = url.attrs["href"]
                 members = []
@@ -759,10 +815,18 @@ class FacebookScraper:
 
     def get(self, url, **kwargs):
         try:
+            url = str(url)
             if not url.startswith("http"):
                 url = utils.urljoin(FB_MOBILE_BASE_URL, url)
 
             response = self.session.get(url=url, **self.requests_kwargs, **kwargs)
+            DEBUG = False
+            if DEBUG:
+                for filename in os.listdir("."):
+                    if filename.endswith(".html") and filename.replace(".html", "") in url:
+                        logger.debug(f"Replacing {url} content with {filename}")
+                        with open(filename) as f:
+                            response.html.html = f.read()
             response.html.html = response.html.html.replace('<!--', '').replace('-->', '')
             response.raise_for_status()
             self.check_locale(response)
@@ -795,6 +859,8 @@ class FacebookScraper:
                 warnings.warn(
                     f"Facebook served mbasic/noscript content unexpectedly on {response.url}"
                 )
+            if response.html.find("h1,h2", containing="Unsupported Browser"):
+                warnings.warn(f"Facebook says 'Unsupported Browser'")
             title = response.html.find("title", first=True)
             not_found_titles = ["page not found", "content not found"]
             temp_ban_titles = [
@@ -859,7 +925,7 @@ class FacebookScraper:
         if login_error:
             raise exceptions.LoginError(login_error.text)
 
-        if "Enter login code to continue" in response.text:
+        if "enter login code to continue" in response.text.lower():
             token = input("Enter 2FA token: ")
             response = self.submit_form(response, {"approvals_code": token})
             strong = response.html.find("strong", first=True)
@@ -867,19 +933,19 @@ class FacebookScraper:
                 raise exceptions.LoginError(strong.text)
             # Remember Browser
             response = self.submit_form(response, {"name_action_selected": "save_device"})
-            if "Review recent login" in response.text:
+            if "review recent login" in response.text.lower():
                 response = self.submit_form(response)
                 # Login near {location} from {browser} on {OS} ({time}). Unset "This wasn't me", leaving "This was me" set.
                 response = self.submit_form(response, {"submit[This wasn't me]": None})
                 # Remember Browser. Please save the browser that you just verified. You won't have to enter a code when you log in from browsers that you've saved.
                 response = self.submit_form(response, {"name_action_selected": "save_device"})
 
-        if "Login approval needed" in response.text or "checkpoint" in response.url:
+        if "login approval needed" in response.text.lower() or "checkpoint" in response.url:
             input(
                 "Login approval needed. From a browser logged into this account, approve this login from your notifications. Press enter once you've approved it."
             )
             response = self.submit_form(response, {"submit[Continue]": "Continue"})
-        if "The password that you entered is incorrect" in response.text:
+        if "the password that you entered is incorrect" in response.text.lower():
             raise exceptions.LoginError("The password that you entered is incorrect")
         if 'c_user' not in self.session.cookies:
             with open("login_error.html", "w") as f:
